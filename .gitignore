@@ -1,0 +1,4 @@
+build/
+*.ini
+gpu_log_*.csv
+gpu_fancurve_*.png
