@@ -1,0 +1,8 @@
+# One line per app. Every app has its own exe name, AppUserModelID, window
+# class, data folder and installer GUID, so all of them install and run side by side.
+# key                  | display name            | AppUserModelID                                | installer GUID (AppId)                 | source                                  | flags          | accent | extra libs
+GPUFanCurveMonitor     | GPU Fan Curve Monitor   | CoolCupMan.Afterburner.GPUFanCurveMonitor     | 12ee3cf7-f27a-4343-9d09-7e6ff2b19e64   | src/GPUFanCurveMonitor.cpp              |                | 22d3ee |
+GPUFanTracer           | GPU Fan Tracer          | CoolCupMan.Afterburner.GPUFanTracer           | 5ad65994-25cf-428d-9f77-6f7ab2bd7e41   | src/tracer/GPUFanTracer.cpp             |                | 38bdf8 |
+GPUFanTracerPlus       | GPU Fan Tracer Plus     | CoolCupMan.Afterburner.GPUFanTracerPlus       | 97566b1f-6ce0-4f33-8f13-ed74547c686e   | src/tracer/GPUFanTracer.cpp             | -DTRACER_PLUS  | ff4d5e |
+GPUFanSpeedMonitor     | GPU Fan Speed Monitor   | CoolCupMan.Afterburner.GPUFanSpeedMonitor     | 900c164a-fe19-4f78-b6f0-a4f6ae7a722f   | src/fanspeed/GPUFanSpeedMonitor.cpp     |                | ff7a45 |
+SystemResourceMonitor  | System Resource Monitor | CoolCupMan.Afterburner.SystemResourceMonitor  | d4c84b1d-4a6e-4ea7-aa3c-ff8dee895aec   | src/sysmon/SystemResourceMonitor.cpp    |                | a78bfa | -lwbemuuid -loleaut32

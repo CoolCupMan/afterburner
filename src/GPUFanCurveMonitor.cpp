@@ -16,38 +16,21 @@
 // Build (MinGW-w64):  see build.sh / README.md
 // ---------------------------------------------------------------------------
 
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
+#include "common/AppCommon.h"
 
-#include <windows.h>
-#include <windowsx.h>
 #include <commdlg.h>
-#include <shellapi.h>
-#include <objidl.h>
-#include <gdiplus.h>
 
-#include <algorithm>
 #include <atomic>
-#include <cmath>
-#include <cstdio>
 #include <cstdlib>
-#include <cwchar>
 #include <deque>
-#include <map>
-#include <string>
-#include <vector>
-
-using namespace Gdiplus;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-static const wchar_t* APP_NAME = L"GPU Fan Curve Monitor";
-static const wchar_t* CLASS_NAME = L"GpuFanCurveMonitorWnd";
+static const AppIdentity APP_ID = {
+    L"CoolCupMan.Afterburner.GPUFanCurveMonitor", L"GPU Fan Curve Monitor",
+    L"Afterburner.GPUFanCurveMonitor.Wnd", L"GPUFanCurveMonitor"};
+static const wchar_t* APP_NAME = APP_ID.name;
 
 static const size_t MAX_HISTORY = 3600;   // samples kept per GPU
 static const int CURVE_POINTS = 240;      // trace length on the fan curve
@@ -61,15 +44,9 @@ static const int INTERVALS[] = {500, 1000, 2000, 3000, 4000, 5000, 10000};
 enum Cmd {
     CMD_PAUSE = 100, CMD_CLEAR, CMD_NEXTGPU, CMD_FASTER, CMD_SLOWER,
     CMD_ALERT_UP, CMD_ALERT_DOWN, CMD_LOG, CMD_EXPORT, CMD_SHOT, CMD_COPY,
-    CMD_TOP, CMD_DEMO, CMD_BEEP, CMD_HELP, CMD_EXIT
+    CMD_TOP, CMD_DEMO, CMD_BEEP, CMD_HELP, CMD_FOLDER, CMD_EXIT
 };
 
-namespace pal {
-const DWORD bg = 0x0f1117, card = 0x171a23, cardBorder = 0x262b38,
-            grid = 0x222735, axis = 0x5c667a, text = 0xe8ebf2, dim = 0x8b93a7,
-            cyan = 0x22d3ee, green = 0x3dfc8b, red = 0xff4d5e, amber = 0xfbbf24,
-            purple = 0xa78bfa, orange = 0xff7a45;
-}
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -141,8 +118,7 @@ struct App {
     std::wstring toast;
     ULONGLONG toastUntil = 0;
 
-    std::wstring exeDir, iniPath;
-    ULONG_PTR gdipToken = 0;
+    AppPaths paths;
 
     // command-line snapshot mode
     std::wstring snapshotPath;
@@ -150,160 +126,14 @@ struct App {
 };
 
 static App g;
-static float S = 1.f;  // DPI scale
 
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
-static double Clampd(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
-static float Minf(float a, float b) { return a < b ? a : b; }
-
-static Color Col(DWORD rgb, BYTE a = 255) {
-    return Color(a, (BYTE)(rgb >> 16), (BYTE)(rgb >> 8), (BYTE)rgb);
-}
-
-static Color TempColor(double t, BYTE a = 255) {
-    struct Stop { double t; DWORD c; };
-    static const Stop st[] = {{30, 0x38bdf8}, {50, 0x3dfc8b}, {70, 0xfbbf24}, {85, 0xff7a45}, {95, 0xff3355}};
-    const int n = sizeof(st) / sizeof(st[0]);
-    if (std::isnan(t)) return Col(pal::dim, a);
-    if (t <= st[0].t) return Col(st[0].c, a);
-    for (int i = 0; i < n - 1; i++) {
-        if (t <= st[i + 1].t) {
-            double f = (t - st[i].t) / (st[i + 1].t - st[i].t);
-            auto ch = [&](int sh) {
-                double c0 = (st[i].c >> sh) & 255, c1 = (st[i + 1].c >> sh) & 255;
-                return (BYTE)(c0 + (c1 - c0) * f);
-            };
-            return Color(a, ch(16), ch(8), ch(0));
-        }
-    }
-    return Col(st[n - 1].c, a);
-}
-
-static std::wstring Fmt(double v, int prec, const wchar_t* suffix = L"") {
-    if (std::isnan(v)) return L"N/A";
-    wchar_t b[64];
-    swprintf(b, 64, L"%.*f%ls", prec, v, suffix);
-    return b;
-}
-
-static std::wstring Trim(const std::wstring& s) {
-    size_t a = s.find_first_not_of(L" \t\r\n");
-    if (a == std::wstring::npos) return L"";
-    size_t b = s.find_last_not_of(L" \t\r\n");
-    return s.substr(a, b - a + 1);
-}
-
-static double ParseNum(const std::wstring& raw) {
-    std::wstring s = Trim(raw);
-    if (s.empty() || s[0] == L'[' || s == L"N/A") return NAN;
-    wchar_t* end = nullptr;
-    double v = wcstod(s.c_str(), &end);
-    if (end == s.c_str()) return NAN;
-    return v;
-}
-
-static std::wstring Utf8ToWide(const std::string& s) {
-    if (s.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
-    std::wstring w(n, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
-    return w;
-}
-
-static std::string WideToUtf8(const std::wstring& w) {
-    if (w.empty()) return "";
-    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    std::string s(n, 0);
-    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &s[0], n, nullptr, nullptr);
-    return s;
-}
-
-static std::wstring Stamp() {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    wchar_t b[32];
-    swprintf(b, 32, L"%04d%02d%02d_%02d%02d%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-    return b;
-}
-
 static void Toast(const std::wstring& msg) {
     g.toast = msg;
     g.toastUntil = GetTickCount64() + 3500;
     if (g.hwnd) InvalidateRect(g.hwnd, nullptr, FALSE);
-}
-
-// ---------------------------------------------------------------------------
-// nvidia-smi (hidden process, timeout protected)
-// ---------------------------------------------------------------------------
-static bool RunCapture(const std::wstring& cmd, std::string& out, DWORD& exitCode, DWORD timeoutMs = 5000) {
-    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
-    HANDLE rd = nullptr, wr = nullptr;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) return false;
-    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    si.hStdOutput = wr;
-    si.hStdError = wr;
-    PROCESS_INFORMATION pi{};
-
-    std::vector<wchar_t> buf(cmd.begin(), cmd.end());
-    buf.push_back(0);
-    BOOL ok = CreateProcessW(nullptr, buf.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    CloseHandle(wr);
-    if (!ok) {
-        CloseHandle(rd);
-        return false;
-    }
-
-    ULONGLONG deadline = GetTickCount64() + timeoutMs;
-    bool exited = false;
-    char chunk[4096];
-    for (;;) {
-        DWORD avail = 0;
-        if (!PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr)) break;  // pipe closed
-        if (avail) {
-            DWORD n = 0;
-            DWORD want = avail < sizeof(chunk) ? avail : (DWORD)sizeof(chunk);
-            if (!ReadFile(rd, chunk, want, &n, nullptr) || !n) break;
-            out.append(chunk, n);
-            continue;
-        }
-        if (exited) break;
-        if (WaitForSingleObject(pi.hProcess, 20) == WAIT_OBJECT_0) {
-            exited = true;
-            continue;
-        }
-        if (GetTickCount64() > deadline) {
-            TerminateProcess(pi.hProcess, 1);
-            break;
-        }
-    }
-    exitCode = 1;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    CloseHandle(rd);
-    return true;
-}
-
-static std::vector<std::wstring> SplitCsv(const std::wstring& line) {
-    std::vector<std::wstring> f;
-    size_t p = 0;
-    for (;;) {
-        size_t c = line.find(L',', p);
-        if (c == std::wstring::npos) {
-            f.push_back(Trim(line.substr(p)));
-            break;
-        }
-        f.push_back(Trim(line.substr(p, c - p)));
-        p = c + 1;
-    }
-    return f;
 }
 
 // Fields: full query has the name last so commas inside names are harmless.
@@ -457,136 +287,20 @@ static DWORD WINAPI Worker(LPVOID) {
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
-static int IniInt(const wchar_t* key, int def) {
-    return (int)GetPrivateProfileIntW(L"Settings", key, def, g.iniPath.c_str());
-}
-static void IniSet(const wchar_t* key, int v) {
-    wchar_t b[32];
-    swprintf(b, 32, L"%d", v);
-    WritePrivateProfileStringW(L"Settings", key, b, g.iniPath.c_str());
-}
+static int IniInt(const wchar_t* key, int def) { return IniGetInt(g.paths.iniPath, key, def); }
+static void IniSet(const wchar_t* key, int v) { IniSetInt(g.paths.iniPath, key, v); }
 
 static void SaveSettings() {
     IniSet(L"IntervalMs", g.intervalMs);
     IniSet(L"AlertTemp", g.alertTemp);
     IniSet(L"Beep", g.beep);
     IniSet(L"TopMost", g.topmost);
-    WINDOWPLACEMENT wp{sizeof(wp)};
-    if (g.hwnd && GetWindowPlacement(g.hwnd, &wp)) {
-        IniSet(L"X", wp.rcNormalPosition.left);
-        IniSet(L"Y", wp.rcNormalPosition.top);
-        IniSet(L"W", wp.rcNormalPosition.right - wp.rcNormalPosition.left);
-        IniSet(L"H", wp.rcNormalPosition.bottom - wp.rcNormalPosition.top);
-        IniSet(L"Maximized", wp.showCmd == SW_SHOWMAXIMIZED);
-    }
+    SaveWindowPlacement(g.hwnd, g.paths.iniPath);
 }
 
 // ---------------------------------------------------------------------------
 // Drawing helpers (GDI+)
 // ---------------------------------------------------------------------------
-static std::map<int, Font*> g_fonts;
-static FontFamily* g_family = nullptr;
-static FontFamily* g_monoFamily = nullptr;
-
-static Font* GetFont(float px, int style, bool mono = false) {
-    int key = ((int)(px * 10) * 8 + style) * 2 + (mono ? 1 : 0);
-    auto it = g_fonts.find(key);
-    if (it != g_fonts.end()) return it->second;
-    Font* f = new Font(mono ? g_monoFamily : g_family, px * S, style, UnitPixel);
-    g_fonts[key] = f;
-    return f;
-}
-
-static RectF Measure(Graphics& gr, const std::wstring& s, float px, int style = FontStyleRegular) {
-    RectF bb;
-    StringFormat fmt;
-    fmt.SetFormatFlags(StringFormatFlagsNoWrap);
-    gr.MeasureString(s.c_str(), -1, GetFont(px, style), PointF(0, 0), &fmt, &bb);
-    return bb;
-}
-
-// align: 0 left, 1 center, 2 right. Returns text width.
-static float TextAt(Graphics& gr, const std::wstring& s, float x, float y, float px, Color c,
-                    int style = FontStyleRegular, int align = 0, bool mono = false) {
-    Font* f = GetFont(px, style, mono);
-    SolidBrush b(c);
-    StringFormat fmt;
-    fmt.SetAlignment(align == 0 ? StringAlignmentNear : align == 1 ? StringAlignmentCenter : StringAlignmentFar);
-    fmt.SetFormatFlags(StringFormatFlagsNoWrap);
-    gr.DrawString(s.c_str(), -1, f, PointF(x, y), &fmt, &b);
-    RectF bb;
-    gr.MeasureString(s.c_str(), -1, f, PointF(0, 0), &fmt, &bb);
-    return bb.Width;
-}
-
-static void TextIn(Graphics& gr, const std::wstring& s, const RectF& r, float px, Color c,
-                   int style = FontStyleRegular, bool wrap = true) {
-    SolidBrush b(c);
-    StringFormat fmt;
-    fmt.SetTrimming(StringTrimmingEllipsisCharacter);
-    if (!wrap) fmt.SetFormatFlags(StringFormatFlagsNoWrap);
-    gr.DrawString(s.c_str(), -1, GetFont(px, style), r, &fmt, &b);
-}
-
-static void RoundPath(GraphicsPath& p, RectF r, float rad) {
-    float d = rad * 2;
-    if (d > r.Width) d = r.Width;
-    if (d > r.Height) d = r.Height;
-    if (d < 1) {
-        p.AddRectangle(r);
-        return;
-    }
-    p.AddArc(r.X, r.Y, d, d, 180, 90);
-    p.AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
-    p.AddArc(r.X + r.Width - d, r.Y + r.Height - d, d, d, 0, 90);
-    p.AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
-    p.CloseFigure();
-}
-
-static void FillRound(Graphics& gr, RectF r, float rad, Color fill, Color border = Color(0, 0, 0, 0), float bw = 1) {
-    if (r.Width <= 0 || r.Height <= 0) return;
-    GraphicsPath p;
-    RoundPath(p, r, rad);
-    SolidBrush b(fill);
-    gr.FillPath(&b, &p);
-    if (border.GetA()) {
-        Pen pen(border, bw);
-        gr.DrawPath(&pen, &p);
-    }
-}
-
-static float Pill(Graphics& gr, float x, float cy, const std::wstring& s, DWORD color, bool right = false) {
-    RectF m = Measure(gr, s, 11, FontStyleBold);
-    float w = m.Width + 14 * S, h = 20 * S;
-    if (right) x -= w;
-    FillRound(gr, RectF(x, cy - h / 2, w, h), h / 2, Col(color, 38), Col(color, 150));
-    TextAt(gr, s, x + w / 2, cy - m.Height / 2, 11, Col(color), FontStyleBold, 1);
-    return w;
-}
-
-static void Card(Graphics& gr, const RectF& r) {
-    FillRound(gr, r, 10 * S, Col(pal::card), Col(pal::cardBorder));
-}
-
-static void LegendItem(Graphics& gr, float& x, float cy, const std::wstring& label, Color c, int kind) {
-    // kind: 0 line, 1 dot, 2 dashed line; drawn right-to-left
-    RectF m = Measure(gr, label, 11);
-    x -= m.Width;
-    TextAt(gr, label, x, cy - m.Height / 2, 11, Col(pal::dim));
-    x -= 6 * S;
-    if (kind == 1) {
-        SolidBrush b(c);
-        gr.FillEllipse(&b, x - 8 * S, cy - 4 * S, 8 * S, 8 * S);
-        x -= 8 * S;
-    } else {
-        Pen p(c, 2.5f * S);
-        if (kind == 2) p.SetDashStyle(DashStyleDash);
-        gr.DrawLine(&p, x - 16 * S, cy, x, cy);
-        x -= 16 * S;
-    }
-    x -= 14 * S;
-}
-
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
@@ -1010,7 +724,8 @@ static void DrawHelp(Graphics& gr, float W, float H) {
         {L"B", L"Toggle alert beep"},
         {L"L", L"Start / stop continuous CSV logging"},
         {L"S", L"Export history to CSV…"},
-        {L"P", L"Save PNG screenshot next to the .exe"},
+        {L"P", L"Save PNG screenshot to the data folder"},
+        {L"O", L"Open data folder (logs, screenshots, settings)"},
         {L"Ctrl+C", L"Copy screenshot to clipboard"},
         {L"T", L"Toggle always-on-top"},
         {L"C", L"Clear history and statistics"},
@@ -1075,18 +790,6 @@ static void Render(Graphics& gr, int Wi, int Hi) {
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
-static bool GetEncoderClsid(const WCHAR* mime, CLSID* clsid) {
-    UINT n = 0, size = 0;
-    GetImageEncodersSize(&n, &size);
-    if (!size) return false;
-    std::vector<BYTE> buf(size);
-    auto* info = (ImageCodecInfo*)buf.data();
-    GetImageEncoders(n, size, info);
-    for (UINT i = 0; i < n; i++)
-        if (wcscmp(info[i].MimeType, mime) == 0) { *clsid = info[i].Clsid; return true; }
-    return false;
-}
-
 static void ClientSize(int& W, int& H) {
     RECT rc{0, 0, 1200, 760};
     if (g.hwnd) GetClientRect(g.hwnd, &rc);
@@ -1097,18 +800,11 @@ static void ClientSize(int& W, int& H) {
 static bool SavePng(const std::wstring& path) {
     int W, H;
     ClientSize(W, H);
-    Bitmap bmp(W, H, PixelFormat32bppARGB);
-    {
-        Graphics gr(&bmp);
-        Render(gr, W, H);
-    }
-    CLSID c;
-    if (!GetEncoderClsid(L"image/png", &c)) return false;
-    return bmp.Save(path.c_str(), &c, nullptr) == Ok;
+    return RenderToPng(path, W, H, Render);
 }
 
 static void Screenshot() {
-    std::wstring path = g.exeDir + L"gpu_fancurve_" + Stamp() + L".png";
+    std::wstring path = g.paths.dataDir + L"gpu_fancurve_" + Stamp() + L".png";
     if (SavePng(path)) Toast(L"Screenshot saved: " + path.substr(path.find_last_of(L'\\') + 1));
     else Toast(L"Could not save screenshot (folder not writable?)");
 }
@@ -1184,7 +880,7 @@ static void ToggleLog() {
         Toast(L"Logging stopped");
         return;
     }
-    g.logPath = g.exeDir + L"gpu_log_" + Stamp() + L".csv";
+    g.logPath = g.paths.dataDir + L"gpu_log_" + Stamp() + L".csv";
     g.log = _wfopen(g.logPath.c_str(), L"wb");
     if (!g.log) { Toast(L"Could not create log file (folder not writable?)"); return; }
     WriteCsvHeader(g.log);
@@ -1286,6 +982,7 @@ static void DoCommand(int id) {
         break;
     case CMD_BEEP: g.beep = !g.beep; Toast(g.beep ? L"Alert beep on" : L"Alert beep off"); break;
     case CMD_HELP: g.help = !g.help; break;
+    case CMD_FOLDER: OpenFolder(g.paths.dataDir); break;
     case CMD_EXIT: PostMessageW(g.hwnd, WM_CLOSE, 0, 0); break;
     }
     InvalidateRect(g.hwnd, nullptr, FALSE);
@@ -1314,6 +1011,7 @@ static void ShowMenu(HWND hwnd, int x, int y) {
     item(CMD_DEMO, L"Demo mode\tD", g.demo);
     item(CMD_CLEAR, L"Clear history\tC");
     item(CMD_HELP, L"Keyboard shortcuts\tH");
+    item(CMD_FOLDER, L"Open data folder (logs, screenshots)\tO");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     item(CMD_EXIT, L"Exit");
     if (x == -1 && y == -1) {
@@ -1382,28 +1080,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ERASEBKGND:
         return 1;
 
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-        RECT rc;
-        GetClientRect(hwnd, &rc);  // full client rect (the prototypes used rcPaint by mistake)
-        int W = rc.right, H = rc.bottom;
-        if (W > 0 && H > 0) {
-            HDC mem = CreateCompatibleDC(hdc);
-            HBITMAP bm = CreateCompatibleBitmap(hdc, W, H);
-            HGDIOBJ old = SelectObject(mem, bm);
-            {
-                Graphics gr(mem);
-                Render(gr, W, H);
-            }
-            BitBlt(hdc, 0, 0, W, H, mem, 0, 0, SRCCOPY);
-            SelectObject(mem, old);
-            DeleteObject(bm);
-            DeleteDC(mem);
-        }
-        EndPaint(hwnd, &ps);
+    case WM_PAINT:
+        PaintBuffered(hwnd, Render);  // whole client rect (the prototypes painted rcPaint by mistake)
         return 0;
-    }
 
     case WM_SIZE:
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -1434,6 +1113,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case 'T': DoCommand(CMD_TOP); break;
         case 'D': DoCommand(CMD_DEMO); break;
         case 'B': DoCommand(CMD_BEEP); break;
+        case 'O': DoCommand(CMD_FOLDER); break;
         default:
             if (wp >= '0' && wp <= '9' && g.gpus.count((int)(wp - '0'))) {
                 g.sel = (int)(wp - '0');
@@ -1476,22 +1156,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 // Entry point
 // ---------------------------------------------------------------------------
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
-    SetProcessDPIAware();
+    CommonArgs common = ParseCommonArgs();
+    if (!common.shortcut.empty()) return SetShortcutAppId(common.shortcut, APP_ID.appId) ? 0 : 1;
 
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(nullptr, path, MAX_PATH);
-    g.exeDir = path;
-    g.exeDir = g.exeDir.substr(0, g.exeDir.find_last_of(L"\\/") + 1);
-    g.iniPath = g.exeDir + L"GPUFanCurveMonitor.ini";
-
-    g.intervalMs = IniInt(L"IntervalMs", 2000);
-    if (g.intervalMs < 250) g.intervalMs = 250;
-    g.alertTemp = IniInt(L"AlertTemp", 85);
-    g.beep = IniInt(L"Beep", 1) != 0;
-    bool wantTop = IniInt(L"TopMost", 0) != 0;
-
-    // Command line: --demo  --interval <ms>  --alert <C>  --log  --snapshot <file.png> [--samples N]
-    bool startLog = false;
+    // Command line: --demo  --interval <ms>  --alert <C>  --log  --topmost  --new-instance
+    //               --snapshot <file.png> [--samples N]
+    bool startLog = false, wantTopArg = false, multi = false;
+    int argIntervalMs = 0, argAlert = 0;
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; argv && i < argc; i++) {
@@ -1499,62 +1170,29 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         bool hasNext = i + 1 < argc;
         if (a == L"--demo") g.demo = true;
         else if (a == L"--log") startLog = true;
-        else if (a == L"--topmost") wantTop = true;
-        else if (a == L"--interval" && hasNext) g.intervalMs = _wtoi(argv[++i]) < 50 ? 50 : _wtoi(argv[i]);
-        else if (a == L"--alert" && hasNext) g.alertTemp = _wtoi(argv[++i]);
+        else if (a == L"--topmost") wantTopArg = true;
+        else if (a == L"--new-instance") multi = true;
+        else if (a == L"--interval" && hasNext) argIntervalMs = _wtoi(argv[++i]) < 50 ? 50 : _wtoi(argv[i]);
+        else if (a == L"--alert" && hasNext) argAlert = _wtoi(argv[++i]);
         else if (a == L"--snapshot" && hasNext) g.snapshotPath = argv[++i];
         else if (a == L"--samples" && hasNext) g.snapshotAfter = (size_t)_wtoi(argv[++i]);
     }
     if (argv) LocalFree(argv);
+    if (!g.snapshotPath.empty()) multi = true;
 
-    GdiplusStartupInput gsi;
-    GdiplusStartup(&g.gdipToken, &gsi, nullptr);
-    g_family = new FontFamily(L"Segoe UI");
-    if (g_family->GetLastStatus() != Ok) {
-        delete g_family;
-        g_family = FontFamily::GenericSansSerif()->Clone();
-    }
-    g_monoFamily = new FontFamily(L"Consolas");
-    if (g_monoFamily->GetLastStatus() != Ok) {
-        delete g_monoFamily;
-        g_monoFamily = FontFamily::GenericMonospace()->Clone();
-    }
+    if (!InitAppIdentity(APP_ID, g.paths, multi)) return 0;
 
-    HDC sdc = GetDC(nullptr);
-    S = GetDeviceCaps(sdc, LOGPIXELSY) / 96.0f;
-    ReleaseDC(nullptr, sdc);
-    if (S < 1) S = 1;
+    g.intervalMs = IniInt(L"IntervalMs", 2000);
+    if (g.intervalMs < 250) g.intervalMs = 250;
+    g.alertTemp = IniInt(L"AlertTemp", 85);
+    g.beep = IniInt(L"Beep", 1) != 0;
+    bool wantTop = wantTopArg || IniInt(L"TopMost", 0) != 0;
+    if (argIntervalMs) g.intervalMs = argIntervalMs;
+    if (argAlert) g.alertTemp = argAlert;
 
-    WNDCLASSEXW wc{sizeof(wc)};
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInst;
-    wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(1));
-    wc.hIconSm = (HICON)LoadImageW(hInst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
-                                   GetSystemMetrics(SM_CYSMICON), 0);
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = nullptr;
-    wc.lpszClassName = CLASS_NAME;
-    RegisterClassExW(&wc);
-
-    int w = IniInt(L"W", (int)(1240 * S)), h = IniInt(L"H", (int)(780 * S));
-    int x = IniInt(L"X", CW_USEDEFAULT), y = IniInt(L"Y", CW_USEDEFAULT);
-    // keep the window on a visible monitor
-    RECT wr{x, y, x + w, y + h};
-    if (x != CW_USEDEFAULT && !MonitorFromRect(&wr, MONITOR_DEFAULTTONULL)) x = y = CW_USEDEFAULT;
-
-    HWND hwnd = CreateWindowExW(0, CLASS_NAME, APP_NAME, WS_OVERLAPPEDWINDOW, x, y, w, h,
-                                nullptr, nullptr, hInst, nullptr);
+    UiStartup();
+    HWND hwnd = CreateAppWindow(APP_ID, hInst, WndProc, g.paths, 1240, 780);
     if (!hwnd) return 1;
-
-    // dark title bar on Windows 10 1809+ / 11 (ignored elsewhere)
-    typedef HRESULT(WINAPI * DwmSetAttr)(HWND, DWORD, LPCVOID, DWORD);
-    if (HMODULE dwm = LoadLibraryW(L"dwmapi.dll")) {
-        if (auto fn = (DwmSetAttr)(void*)GetProcAddress(dwm, "DwmSetWindowAttribute")) {
-            BOOL dark = TRUE;
-            if (FAILED(fn(hwnd, 20, &dark, sizeof(dark)))) fn(hwnd, 19, &dark, sizeof(dark));
-        }
-    }
 
     if (wantTop) SetTopmost(true);
     if (startLog) ToggleLog();
@@ -1573,11 +1211,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
         DispatchMessageW(&m);
     }
 
-    for (auto& kv : g_fonts) delete kv.second;
-    g_fonts.clear();
-    delete g_family;
-    delete g_monoFamily;
-    GdiplusShutdown(g.gdipToken);
+    UiShutdown();
     CloseHandle(g.stopEvent);
     CloseHandle(g.wakeEvent);
     return 0;

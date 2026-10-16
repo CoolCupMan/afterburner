@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
-"""Generate res/app.ico (16/24/32/48/64/128/256 px) procedurally - no dependencies."""
+"""Generate an .ico (16..256 px) procedurally - no dependencies.
+
+usage: gen_icon.py out.ico [accent_hex]   e.g. gen_icon.py build/x.ico 22d3ee
+The accent colour starts the gauge gradient and fills the hub, so each app of
+the suite gets its own recognisable icon."""
 import math, struct, sys, zlib
+
+ACCENT = tuple(int((sys.argv[2] if len(sys.argv) > 2 else '22d3ee')[i:i + 2], 16) for i in (0, 2, 4))
 
 def lerp(a, b, t): return a + (b - a) * t
 
@@ -20,7 +26,7 @@ def pixel(x, y, n):
         a = (ang - 135) % 360
         if a <= 270:
             t = a / 270
-            stops = [(0x22, 0xd3, 0xee), (0x3d, 0xfc, 0x8b), (0xfb, 0xbf, 0x24), (0xff, 0x4d, 0x5e)]
+            stops = [ACCENT, tuple((a + b) // 2 for a, b in zip(ACCENT, (0xfb, 0xbf, 0x24))), (0xfb, 0xbf, 0x24), (0xff, 0x4d, 0x5e)]
             seg = min(int(t * 3), 2); f = t * 3 - seg
             c0, c1 = stops[seg], stops[seg + 1]
             col = tuple(int(lerp(c0[i], c1[i], f)) for i in range(3)) + (255,)
@@ -32,7 +38,7 @@ def pixel(x, y, n):
     t = dx * ux + dy * uy
     d = abs(-dx * uy + dy * ux)
     if 0 < t < n * 0.36 and d < n * 0.035: col = (232, 235, 242, 255)
-    if r < 0.16: col = (0x3d, 0xfc, 0x8b, 255)
+    if r < 0.16: col = ACCENT + (255,)
     return col
 
 def render(n):
